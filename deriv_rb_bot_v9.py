@@ -1,6 +1,6 @@
 """
 +=========================================================================+
-|  DERIV RANGE BOT  v9  —  RDBEAR  (Pure ContainmentEstimator)          |
+|  DERIV RANGE BOT  v9  —  RDBEAR  (ContainmentEstimator + SignalEngine)|
 |                                                                         |
 |  Stripped of all LSTM / LightGBM / training infrastructure.            |
 |  The sole intelligence is the statistical layer:                        |
@@ -27,7 +27,7 @@
 |                                                                         |
 |  Start: collect 30 min of ticks → calibrate barriers → live trade      |
 |                                                                         |
-|  Requirements: pip install numpy scipy websocket-client pandas          |
+|  Requirements: pip install numpy scipy websocket-client pandas arch     |
 |  Env:          DERIV_API_TOKEN                                          |
 +=========================================================================+
 """
@@ -41,6 +41,14 @@ import numpy as np
 from scipy import stats as scipy_stats
 import websocket
 import pandas as pd
+try:
+    from arch import arch_model
+    _ARCH_AVAILABLE = True
+except ImportError:
+    _ARCH_AVAILABLE = False
+    log_stub = logging.getLogger("DerivRB_v9")
+    log_stub.warning("[SignalEngine] `arch` library not found — GARCH filter disabled. "
+                     "Install with: pip install arch")
 
 
 # ---------------------------------------------------------------------------
@@ -75,21 +83,32 @@ CONFIG = {
     "min_ticks"     : 500,          # minimum ticks before live trading starts
 
     # -- Expiry choices (minutes) ----------------------------------------------
-    "hold_durations" : [2, 3, 4, 5, 6],
+    "hold_durations" : [2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 15],  # extended to 15m
 
     # -- Barrier ---------------------------------------------------------------
-    "expiryrange_barrier" : 2.97,   # fallback if calibration hasn't run
+    "expiryrange_barrier" : 2.97,   # fallback for short durations; long durs scale up
     "currency"            : "USD",
 
     # -- ContainmentEstimator --------------------------------------------------
-    "containment_vol_window"   : 60,    # ticks for EWMA σ
-    "containment_drift_window" : 30,    # ticks for μ (drift) estimation
-    "containment_hurst_window" : 120,   # ticks for Hurst R/S
+    # Windows are in ticks. RDBEAR ticks ~180-240/min, so these are auto-scaled
+    # by tpm at runtime — see ContainmentEstimator.from_tick_buf.
+    # Values below are the MINUTES of data wanted; scaling happens in code.
+    "containment_vol_mins"     : 2,     # 2 min of ticks for EWMA σ
+    "containment_drift_mins"   : 1,     # 1 min of ticks for drift μ
+    "containment_hurst_mins"   : 6,     # 6 min of ticks for Hurst R/S (covers longer durations)
+    # Legacy tick-based fallbacks (used if tpm unavailable)
+    "containment_vol_window"   : 60,
+    "containment_drift_window" : 30,
+    "containment_hurst_window" : 120,
     "containment_ewma_alpha"   : 0.06,  # EWMA decay (RiskMetrics λ=0.94)
     "containment_use_drift"    : True,
     "containment_use_hurst"    : True,
     "containment_hurst_scale"  : 0.5,
     "ticks_per_minute"         : None,  # None = auto-detect
+
+    # -- Signal engine filters ------------------------------------------------
+    "signal_engine_enabled"    : True,   # master switch for all three filters
+    "se_log_interval"          : 30,     # ticks between SKIP log lines for SE
 
     # -- EV gate ---------------------------------------------------------------
     "ev_confidence_floor"  : 0.676,  # break-even at 48% payout = 1/1.48
@@ -276,18 +295,24 @@ class ContainmentEstimator:
                       vol_window=60, ticks_per_minute=None,
                       drift_window=30, hurst_window=120,
                       ewma_alpha=0.06, use_drift=True, use_hurst=True,
-                      hurst_scale=0.5):
+                      hurst_scale=0.5,
+                      vol_mins=None, drift_mins=None, hurst_mins=None):
         if not tick_buf: return 0.5
         price  = list(tick_buf)[-1]["price"]
         upper  = price + barrier_offset
         lower  = price - barrier_offset
-        sigma  = cls._ewma_sigma(tick_buf, vol_window, ewma_alpha)
         tpm    = ticks_per_minute or cls._tpm(tick_buf)
+        # Auto-scale windows by tpm so they represent real time, not raw tick count.
+        # vol_mins/drift_mins/hurst_mins take priority over legacy tick counts.
+        v_win  = max(30, int(tpm * vol_mins))   if vol_mins   else vol_window
+        d_win  = max(15, int(tpm * drift_mins)) if drift_mins else drift_window
+        h_win  = max(60, int(tpm * hurst_mins)) if hurst_mins else hurst_window
+        sigma  = cls._ewma_sigma(tick_buf, v_win, ewma_alpha)
         t_tick = max(1.0, tpm * duration_mins)
-        mu     = cls._drift(tick_buf, drift_window, sigma) if use_drift else 0.0
+        mu     = cls._drift(tick_buf, d_win, sigma) if use_drift else 0.0
         p      = cls.p_containment(price, upper, lower, sigma, t_tick, mu)
         if use_hurst:
-            H      = cls._hurst(tick_buf, hurst_window)
+            H      = cls._hurst(tick_buf, h_win)
             factor = float(np.clip(1.0 + hurst_scale*(0.5-H), 0.75, 1.25))
             p      = float(np.clip(p * factor, 0.01, 0.99))
         return p
@@ -587,6 +612,7 @@ class LiveTrader:
         self.post_trade_tick   = 0
         self.consec_losses     = 0
         self.cooldown_until    = 0
+        self.signal_engine     = SignalEngine()
         self.wins = self.total = 0
         self.session_pnl       = 0.0
 
@@ -747,6 +773,20 @@ class LiveTrader:
             self._persist_count = 0
             return
 
+        # ── 1b. Signal Engine — three pre-entry filters ──────────────────────
+        if cfg.get("signal_engine_enabled", True):
+            se_pass, se_details = self.signal_engine.all_pass(
+                self.tick_buf, self.live_tick_count)
+            if not se_pass:
+                self._persist_count = 0
+                if self.live_tick_count % cfg.get("se_log_interval", 30) == 0:
+                    log.info("[SE] SKIP — filter=%s H=%.4f garch_pct=%.1f gbm_prob=%.4f",
+                             se_details.get("failed", "?"),
+                             se_details.get("H", 0),
+                             se_details.get("garch_pct", 0),
+                             se_details.get("gbm_prob", 0))
+                return
+
         # ── 2. ContainmentEstimator across all durations — pick best ──────
         fallback  = cfg.get("expiryrange_barrier", 2.97)
         durations = cfg.get("hold_durations", [2, 3, 4, 5, 6])
@@ -768,6 +808,9 @@ class LiveTrader:
                 use_drift        = cfg.get("containment_use_drift",     True),
                 use_hurst        = cfg.get("containment_use_hurst",     True),
                 hurst_scale      = cfg.get("containment_hurst_scale",   0.5),
+                vol_mins         = cfg.get("containment_vol_mins",      None),
+                drift_mins       = cfg.get("containment_drift_mins",    None),
+                hurst_mins       = cfg.get("containment_hurst_mins",    None),
             )
             if p > best_p:
                 best_p   = p
@@ -818,9 +861,15 @@ class LiveTrader:
             return
 
         # ── All checks passed — send proposal ─────────────────────────────
+        se_info = ""
+        if cfg.get("signal_engine_enabled", True):
+            _, _se = self.signal_engine.all_pass(self.tick_buf, self.live_tick_count)
+            se_info = (f" H={_se.get('H',0):.3f}"
+                       f" garch={_se.get('garch_pct',0):.0f}pct"
+                       f" gbm={_se.get('gbm_prob',0):.3f}")
         log.info("[Intel] *** SIGNAL *** p_stat=%.4f ev=%+.4f "
-                 "dur=%dm regime=%s persistence=%d  → sending proposal",
-                 best_p, ev, best_dur, regime, self._persist_count)
+                 "dur=%dm regime=%s persistence=%d%s  → sending proposal",
+                 best_p, ev, best_dur, regime, self._persist_count, se_info)
 
         self._persist_count = 0   # reset after firing
 
@@ -952,6 +1001,7 @@ class LiveTrader:
             self.consec_losses = 0
         else:
             self.consec_losses += 1
+        self.signal_engine.consec_losses = self.consec_losses
 
         wr = self.wins / self.total * 100
 
@@ -1098,16 +1148,32 @@ class LiveTrader:
                 except Exception: pass
                 t.join(timeout=3)
 
+        # Per-duration search bounds (lo, hi, payout_lo, payout_hi).
+        # Barriers grow with duration — longer hold needs wider range to contain.
+        dur_bounds = {
+            2 : (0.50,  5.0,  0.46, 0.50),
+            3 : (0.80,  6.0,  0.46, 0.50),
+            4 : (1.00,  7.0,  0.46, 0.50),
+            5 : (1.20,  8.0,  0.46, 0.50),
+            6 : (1.40,  9.0,  0.46, 0.50),
+            7 : (1.60, 10.5,  0.46, 0.50),
+            8 : (1.80, 12.0,  0.46, 0.50),
+            9 : (2.00, 13.5,  0.46, 0.50),
+            10: (2.20, 15.0,  0.46, 0.50),
+            12: (2.60, 17.5,  0.46, 0.50),
+            15: (3.00, 21.0,  0.46, 0.50),
+        }
         for dur in durations:
-            lo, hi = 0.5, 8.0; best = fallback; best_pr = None
-            for _ in range(8):
+            lo, hi, p_lo, p_hi = dur_bounds.get(dur, (0.5, 8.0, 0.46, 0.50))
+            best = fallback; best_pr = None
+            for _ in range(10):
                 mid = round((lo + hi) / 2, 2)
                 pr  = _probe(dur, mid)
                 if pr is None: break
-                if best_pr is None or abs(pr-0.49) < abs(best_pr-0.49):
+                if best_pr is None or abs(pr-0.485) < abs(best_pr-0.485):
                     best = mid; best_pr = pr
-                if 0.46 <= pr <= 0.50: break
-                if pr < 0.46: hi = mid
+                if p_lo <= pr <= p_hi: break
+                if pr < p_lo: hi = mid
                 else:         lo = mid
                 time.sleep(0.3)
 
@@ -1122,6 +1188,245 @@ class LiveTrader:
                  {f"{k}m": f"±{v:.2f}" for k, v in self.barrier_table.items()})
         self._calibrating = False
 
+
+
+# ===========================================================================
+# SIGNAL ENGINE  — Three-filter pre-entry gate
+# ===========================================================================
+
+class SignalEngine:
+    """
+    Three independent filters that must ALL pass before any trade entry.
+
+    Filter 1 — Hurst Exponent (R/S analysis, 200-tick window)
+        H < 0.48  → mean-reverting market  → PASS
+        Recomputed every 50 ticks and cached.
+        After 2+ consecutive losses: tightened to H < 0.44.
+
+    Filter 2 — GARCH(1,1) volatility (arch library, 300 log-returns)
+        Forecast one-step-ahead σ must be in the bottom 35th percentile
+        of its own 500-step rolling history → entering only in calm periods.
+        Recomputed every 30 ticks and cached.
+        Falls back to EWMA vol comparison if `arch` is unavailable.
+
+    Filter 3 — GBM barrier probability (analytic reflection principle)
+        P(path stays within ±k·σ over 5 ticks) ≥ 0.62
+        k is solved so the threshold is just met; we check the probability
+        directly using the exact formula for Brownian motion first-passage.
+    """
+
+    # Rolling history lengths
+    HURST_WINDOW     = 200
+    HURST_RECOMPUTE  = 50    # ticks between Hurst recomputations
+    GARCH_WINDOW     = 300   # log-returns for GARCH fit
+    GARCH_RECOMPUTE  = 30    # ticks between GARCH recomputations
+    GARCH_HIST_LEN   = 500   # rolling σ history for percentile calculation
+    GBM_TICKS        = 5     # horizon for GBM stay-in-bounds check
+    GBM_PROB_FLOOR   = 0.62  # minimum stay-in-bounds probability
+
+    def __init__(self):
+        # Hurst cache
+        self._hurst_cache : float | None = None
+        self._hurst_tick  : int          = -999
+
+        # GARCH cache
+        self._garch_sigma_cache : float | None = None
+        self._garch_tick        : int           = -999
+        self._garch_sigma_hist  : deque         = deque(maxlen=self.GARCH_HIST_LEN)
+
+        # streak tracking (set from outside)
+        self.consec_losses : int = 0
+
+    # ── Hurst (R/S analysis) ──────────────────────────────────────────────
+
+    @staticmethod
+    def _compute_hurst(prices: np.ndarray) -> float:
+        """Classic R/S Hurst exponent on a price series."""
+        n = len(prices)
+        if n < 20:
+            return 0.5
+        log_ret = np.diff(np.log(prices + 1e-12))
+        # Split into sub-series of increasing length and compute R/S
+        lags = []
+        rs_vals = []
+        for size in [max(10, n // 8), max(15, n // 4), max(20, n // 2), n]:
+            seg = log_ret[:size]
+            mean = seg.mean()
+            dev  = np.cumsum(seg - mean)
+            R    = dev.max() - dev.min()
+            S    = seg.std(ddof=1)
+            if S > 0:
+                lags.append(np.log(size))
+                rs_vals.append(np.log(R / S))
+        if len(lags) < 2:
+            return 0.5
+        H, _ = np.polyfit(lags, rs_vals, 1)
+        return float(np.clip(H, 0.0, 1.0))
+
+    def hurst(self, tick_buf, current_tick: int) -> float:
+        """Return cached Hurst, recomputing every HURST_RECOMPUTE ticks."""
+        if (self._hurst_cache is None or
+                current_tick - self._hurst_tick >= self.HURST_RECOMPUTE):
+            buf = list(tick_buf)[-self.HURST_WINDOW:]
+            if len(buf) >= 20:
+                prices = np.array([t["price"] for t in buf])
+                self._hurst_cache = self._compute_hurst(prices)
+            else:
+                self._hurst_cache = 0.5
+            self._hurst_tick = current_tick
+        return self._hurst_cache
+
+    def hurst_passes(self, tick_buf, current_tick: int) -> tuple[bool, float]:
+        H = self.hurst(tick_buf, current_tick)
+        threshold = 0.44 if self.consec_losses >= 2 else 0.48
+        return H < threshold, H
+
+    # ── GARCH(1,1) volatility filter ─────────────────────────────────────
+
+    def _fit_garch(self, tick_buf) -> float | None:
+        """Fit GARCH(1,1) and return one-step-ahead σ forecast."""
+        buf = list(tick_buf)[-self.GARCH_WINDOW:]
+        if len(buf) < 50:
+            return None
+        prices   = np.array([t["price"] for t in buf])
+        log_ret  = np.diff(np.log(prices + 1e-12)) * 100  # scale for arch
+        if np.std(log_ret) < 1e-10:
+            return None
+        try:
+            am    = arch_model(log_ret, vol="Garch", p=1, q=1,
+                               dist="normal", rescale=False)
+            res   = am.fit(disp="off", show_warning=False)
+            fc    = res.forecast(horizon=1, reindex=False)
+            sigma = float(np.sqrt(fc.variance.values[-1, 0])) / 100
+            return sigma if np.isfinite(sigma) and sigma > 0 else None
+        except Exception:
+            return None
+
+    def _ewma_sigma_fallback(self, tick_buf) -> float:
+        """EWMA sigma fallback when arch is unavailable."""
+        buf = list(tick_buf)[-self.GARCH_WINDOW:]
+        if len(buf) < 2:
+            return 1e-4
+        prices  = np.array([t["price"] for t in buf])
+        log_ret = np.diff(np.log(prices + 1e-12))
+        alpha   = 0.06
+        var     = log_ret[0] ** 2
+        for r in log_ret[1:]:
+            var = alpha * r**2 + (1 - alpha) * var
+        return float(np.sqrt(var))
+
+    def garch_sigma(self, tick_buf, current_tick: int) -> float | None:
+        """Return cached GARCH σ, recomputing every GARCH_RECOMPUTE ticks."""
+        if (self._garch_sigma_cache is None or
+                current_tick - self._garch_tick >= self.GARCH_RECOMPUTE):
+            if _ARCH_AVAILABLE:
+                sigma = self._fit_garch(tick_buf)
+            else:
+                sigma = self._ewma_sigma_fallback(tick_buf)
+            if sigma is not None:
+                self._garch_sigma_cache = sigma
+                self._garch_sigma_hist.append(sigma)
+            self._garch_tick = current_tick
+        return self._garch_sigma_cache
+
+    def garch_passes(self, tick_buf, current_tick: int) -> tuple[bool, float, float]:
+        """
+        Pass if current GARCH σ is in the bottom 35th percentile
+        of rolling σ history (calm volatility period).
+        Returns (passed, sigma, percentile).
+        """
+        sigma = self.garch_sigma(tick_buf, current_tick)
+        if sigma is None or len(self._garch_sigma_hist) < 10:
+            # Not enough history yet — pass through (don't block cold start)
+            return True, sigma or 0.0, 50.0
+        hist        = np.array(self._garch_sigma_hist)
+        percentile  = float(scipy_stats.percentileofscore(hist, sigma))
+        return percentile <= 35.0, sigma, percentile
+
+    # ── GBM barrier probability (reflection principle) ────────────────────
+
+    @staticmethod
+    def _gbm_stay_prob(sigma: float, n_ticks: int, k: float) -> float:
+        """
+        Analytic probability that a GBM path stays within ±k·σ·√n_ticks
+        over n_ticks steps, using the reflection principle series.
+
+        P(|W_t| < b for all t in [0,T]) = Σ_{n=-∞}^{∞} (-1)^n · Φ(...)
+        Truncated to ±4 terms (converges rapidly for b/σ > 0.5).
+
+        b     = k · σ · √n_ticks  (barrier in price-space normalised units)
+        σ_t   = σ · √n_ticks      (std dev over horizon)
+        """
+        if sigma <= 0 or n_ticks <= 0 or k <= 0:
+            return 0.5
+        b     = k * sigma * math.sqrt(n_ticks)
+        sigma_t = sigma * math.sqrt(n_ticks)
+        if sigma_t < 1e-12:
+            return 1.0
+        prob = 0.0
+        from scipy.special import ndtr  # standard normal CDF
+        for n in range(-4, 5):
+            sign = (-1) ** abs(n)
+            prob += sign * (ndtr((b - 2*n*b) / sigma_t) -
+                            ndtr((-b - 2*n*b) / sigma_t))
+        return float(np.clip(prob, 0.0, 1.0))
+
+    def gbm_passes(self, tick_buf, sigma_override: float | None = None
+                   ) -> tuple[bool, float, float]:
+        """
+        Choose k=1.0 (one-sigma band) and check if stay probability ≥ 0.62.
+        Returns (passed, probability, k_used).
+        """
+        if sigma_override is not None and sigma_override > 0:
+            sigma = sigma_override
+        else:
+            buf   = list(tick_buf)[-50:]
+            if len(buf) < 2:
+                return True, 1.0, 1.0  # cold start — pass through
+            prices  = np.array([t["price"] for t in buf])
+            log_ret = np.diff(np.log(prices + 1e-12))
+            sigma   = float(np.std(log_ret)) if len(log_ret) > 1 else 1e-4
+
+        k    = 1.0
+        prob = self._gbm_stay_prob(sigma, self.GBM_TICKS, k)
+        return prob >= self.GBM_PROB_FLOOR, prob, k
+
+    # ── Master gate ───────────────────────────────────────────────────────
+
+    def all_pass(self, tick_buf, current_tick: int
+                 ) -> tuple[bool, dict]:
+        """
+        Run all three filters. Returns (all_passed, details_dict).
+        Fails fast — stops at first failing filter to save CPU.
+        """
+        details = {}
+
+        # Filter 1: Hurst
+        h_pass, H = self.hurst_passes(tick_buf, current_tick)
+        details["H"] = round(H, 4)
+        details["H_threshold"] = 0.44 if self.consec_losses >= 2 else 0.48
+        if not h_pass:
+            details["failed"] = "HURST"
+            return False, details
+
+        # Filter 2: GARCH
+        g_pass, sigma, pct = self.garch_passes(tick_buf, current_tick)
+        details["garch_sigma"]  = round(sigma, 8)
+        details["garch_pct"]    = round(pct, 1)
+        if not g_pass:
+            details["failed"] = "GARCH"
+            return False, details
+
+        # Filter 3: GBM
+        gbm_pass, prob, k = self.gbm_passes(tick_buf, sigma_override=sigma)
+        details["gbm_prob"] = round(prob, 4)
+        details["gbm_k"]    = round(k, 2)
+        if not gbm_pass:
+            details["failed"] = "GBM"
+            return False, details
+
+        details["failed"] = None
+        return True, details
 
 # ===========================================================================
 # MAIN
