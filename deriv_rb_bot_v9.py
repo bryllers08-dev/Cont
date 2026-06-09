@@ -22,8 +22,8 @@
 |                                                                         |
 |  6. SPRTMonitor  — passive edge tracker, warns if edge disappears      |
 |                                                                         |
-|  7. KellyStaker  — 35% of balance (min $0.35); scales with balance     |
-|       Calibrated for $1 account; stake grows as balance increases      |
+|  7. KellyStaker  — tiered stake: 35%→12%→7%→5% as balance grows      |
+|       Hard cap 10% / $5 max. Min $0.35. Calibrated for $1 account      |
 |                                                                         |
 |  Start: collect 30 min of ticks → calibrate barriers → live trade      |
 |                                                                         |
@@ -119,10 +119,14 @@ CONFIG = {
     # stake_pct=0.35 → $0.35 on $1.00 (hits min), $0.70 on $2.00, scales up.
     # kelly_max_pct=0.50 prevents the 15% cap from cutting below min_stake.
     "kelly_fraction"  : 0.25,
-    "kelly_max_pct"   : 0.50,    # raised so Kelly never caps below min on tiny balance
+    "kelly_max_pct"   : 0.10,    # hard cap: never more than 10% of balance per trade
     "kelly_min_stake" : 0.35,    # Deriv minimum
-    "kelly_max_stake" : 25.0,
-    "stake_pct"       : 0.35,    # 35% of balance → $0.35 on $1, grows with balance
+    "kelly_max_stake" : 5.0,     # absolute max stake regardless of balance
+    "stake_pct"       : 0.35,    # used only as floor logic — see tiered_stake_pct below
+    # Tiered stake % — high enough to hit $0.35 min at $1, tapers off quickly
+    # balance $1.00-$1.99 → 35%  ($0.35–$0.70)
+    # balance $2.00-$4.99 → 15%  ($0.30 → floored to $0.35 min .. $0.75)
+    # balance $5.00+      →  7%  (conservative flat growth)
 
     # -- Risk limits -----------------------------------------------------------
     # Widened for $1 account — tight % limits halt the bot after a single loss.
@@ -343,9 +347,12 @@ class AdaptiveThreshold:
 
 class KellyStaker:
     """
-    PRIMARY: stake_pct × balance (35% → $0.35 on $1, scales with balance).
-    SECONDARY: Kelly overrides if it recommends more (strong-edge situations).
-    Calibrated for $1 starting balance — min stake always $0.35.
+    Tiered stake sizing calibrated for $1 account:
+      $1.00–$1.99  → 35% (ensures $0.35 Deriv minimum is met)
+      $2.00–$4.99  → 12% (tapering off)
+      $5.00–$14.99 →  7% (conservative growth)
+      $15.00+      →  5% (steady compounding)
+    Hard cap: 10% of balance per trade, $5.00 absolute maximum.
     """
     def __init__(self, cfg):
         self.fraction  = cfg["kelly_fraction"]
@@ -355,20 +362,27 @@ class KellyStaker:
         self.stake_pct = cfg.get("stake_pct", 0.035)
         self.wins = self.n = 0
 
+    def _tiered_pct(self, balance):
+        """Step down stake % as balance grows — hits min at $1, conservative above."""
+        if balance < 2.00:  return 0.35   # $1.00–$1.99 → 35%  (floor needed for $0.35 min)
+        if balance < 5.00:  return 0.12   # $2.00–$4.99 → 12%  ($0.24–$0.60, floored to $0.35)
+        if balance < 15.00: return 0.07   # $5.00–$14.99→  7%  ($0.35–$1.05)
+        return 0.05                        # $15.00+     →  5%  (steady growth)
+
     def next_stake(self, p_win, balance, payout_ratio=0.48):
         if balance <= 0: return self.min_stake
-        # Proportional stake scales with balance (anchor for small accounts)
-        prop_stake  = balance * self.stake_pct
-        # Kelly component
+        # Tiered proportional stake — scales down as balance grows
+        prop_stake  = balance * self._tiered_pct(balance)
+        # Kelly component (quarter-Kelly)
         b           = payout_ratio; q = 1.0 - p_win
         f_star      = (p_win*b - q) / b
         kelly_stake = min(f_star*self.fraction, self.max_pct)*balance if f_star > 0 else 0.0
-        # Use whichever is larger, then hard-cap
+        # Take the larger of tiered prop vs Kelly, then hard-cap at 10% and max_stake
         stake = max(prop_stake, kelly_stake)
-        stake = min(stake, self.max_stake, balance * self.max_pct, balance * 0.50)
-        # Always honour Deriv minimum — critical on tiny balances
+        stake = min(stake, self.max_stake, balance * self.max_pct)
+        # Always honour Deriv minimum
         stake = max(stake, self.min_stake)
-        # Never stake more than the full balance
+        # Never stake more than balance
         stake = min(stake, balance)
         return round(stake, 2)
 
