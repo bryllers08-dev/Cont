@@ -67,7 +67,7 @@ CONFIG = {
     "api_token" : os.environ.get("DERIV_API_TOKEN", ""),
 
     # -- Symbol ----------------------------------------------------------------
-    "symbol"    : "RDBEAR",
+    "symbol"    : "1HZ10V",
 
     # -- Tick collection -------------------------------------------------------
     "collect_hours" : 0.5,          # 30 min history → plenty for estimator
@@ -1001,6 +1001,11 @@ class LiveTrader:
             "sprt_status"        : self.sprt.status,
             "session_wr"         : round(wr, 2),
         })
+
+
+        # Recalibrate barriers in background after every trade
+        threading.Thread(target=self._calibrate_barriers,
+                         daemon=True, name="BarrierRecal").start()
 
         # Risk checks
         if not self._risk_ok():
