@@ -75,7 +75,7 @@ CONFIG = {
     "api_token" : os.environ.get("DERIV_API_TOKEN", ""),
 
     # -- Symbol ----------------------------------------------------------------
-    "symbol"    : "1HZ10V",
+    "symbol"    : "RDBEAR",
 
     # -- Tick collection -------------------------------------------------------
     "collect_hours" : 0.5,          # 30 min history → plenty for estimator
