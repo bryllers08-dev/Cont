@@ -1199,9 +1199,9 @@ class SignalEngine:
     Three independent filters that must ALL pass before any trade entry.
 
     Filter 1 — Hurst Exponent (R/S analysis, 200-tick window)
-        H < 0.48  → mean-reverting market  → PASS
+        H < 0.52  → allows mild trending; excludes strong trends  → PASS
         Recomputed every 50 ticks and cached.
-        After 2+ consecutive losses: tightened to H < 0.44.
+        After 2+ consecutive losses: tightened to H < 0.47.
 
     Filter 2 — GARCH(1,1) volatility (arch library, 300 log-returns)
         Forecast one-step-ahead σ must be in the bottom 35th percentile
@@ -1278,7 +1278,7 @@ class SignalEngine:
 
     def hurst_passes(self, tick_buf, current_tick: int) -> tuple[bool, float]:
         H = self.hurst(tick_buf, current_tick)
-        threshold = 0.44 if self.consec_losses >= 2 else 0.48
+        threshold = 0.47 if self.consec_losses >= 2 else 0.52
         return H < threshold, H
 
     # ── GARCH(1,1) volatility filter ─────────────────────────────────────
@@ -1404,7 +1404,7 @@ class SignalEngine:
         # Filter 1: Hurst
         h_pass, H = self.hurst_passes(tick_buf, current_tick)
         details["H"] = round(H, 4)
-        details["H_threshold"] = 0.44 if self.consec_losses >= 2 else 0.48
+        details["H_threshold"] = 0.47 if self.consec_losses >= 2 else 0.52
         if not h_pass:
             details["failed"] = "HURST"
             return False, details
