@@ -1,0 +1,5 @@
+numpy
+scipy
+websocket-client
+pandas
+arch
